@@ -71,12 +71,44 @@ class Person:
         return [e.entity_id for e in self.resolved]
 
 
+async def _safe_insights(qloo, kind: str, entity_ids: list[str], city: str | None, take: int = 12, score_ids: list[str] | None = None, retries: int = 3, backoff: float = 1.5):
+    """Wrapper around qloo.insights with automatic retry on rate limit (429) errors."""
+    for attempt in range(retries):
+        try:
+            if score_ids:
+                return await qloo.insights(kind, entity_ids, city, take=take, score_ids=score_ids)
+            else:
+                return await qloo.insights(kind, entity_ids, city, take=take)
+        except QlooError as e:
+            # Check if it's a rate limit / 429 error message
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff ** (attempt + 1))
+                    continue
+            raise e
+        except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                if attempt < retries - 1:
+                    await asyncio.sleep(backoff ** (attempt + 1))
+                    continue
+            raise e
+    return []
+
+
 async def resolve_people(qloo, people: list[Person]) -> None:
     async def one(p: Person, fav: str):
-        try:
-            return p, fav, await qloo.search(fav)
-        except QlooError:
-            return p, fav, None
+        for attempt in range(3):
+            try:
+                return p, fav, await qloo.search(fav)
+            except QlooError as e:
+                if "429" in str(e) or "rate limit" in str(e).lower():
+                    if attempt < 2:
+                        await asyncio.sleep(1.5 ** (attempt + 1))
+                        continue
+                return p, fav, None
+            except Exception:
+                return p, fav, None
+        return p, fav, None
 
     jobs = [one(p, f) for p in people for f in p.favorites if f.strip()]
     for p, fav, ent in await asyncio.gather(*jobs):
@@ -84,17 +116,26 @@ async def resolve_people(qloo, people: list[Person]) -> None:
 
 
 async def candidates(qloo, people: list[Person], kind: str, city: str | None, take: int = 12) -> list[dict]:
-    """Qloo picks for the whole group, then each person's own affinity for those exact picks."""
+    """Qloo picks for the whole group, then each person's own affinity for those exact picks with rate-limit protection."""
     group_ids = list(dict.fromkeys(i for p in people for i in p.entity_ids))
     if not group_ids:
         return []
-    base = await qloo.insights(kind, group_ids, city, take)
+    
+    base = await _safe_insights(qloo, kind, group_ids, city, take)
     if not base:
         return []
+    
     ids = [e.entity_id for e in base]
-    per_person = await asyncio.gather(
-        *[qloo.insights(kind, p.entity_ids, city, take=len(ids), score_ids=ids) if p.entity_ids else _none() for p in people]
-    )
+    
+    # Fetch per-person insights safely with staggered execution to avoid hitting rate caps
+    per_person = []
+    for p in people:
+        if p.entity_ids:
+            res = await _safe_insights(qloo, kind, p.entity_ids, city, take=len(ids), score_ids=ids)
+            per_person.append(res)
+        else:
+            per_person.append([])
+
     rows = []
     for e in base:
         fit = {}
